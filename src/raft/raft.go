@@ -181,7 +181,8 @@ func (rf *Raft) readPersist(data []byte) {
 	var currentTerm  int
 	var voteFor      int
 	var Log          []LogEntry
-	if d.Decode(&currentTerm) != nil || d.Decode(&voteFor)!=nil ||
+	if  d.Decode(&currentTerm) != nil ||
+		d.Decode(&voteFor)!=nil ||
 		d.Decode(&Log) !=nil {
 		DPrintf("Failed to read persisted data\n")
 	}else{
@@ -244,12 +245,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		//so that the candidate includes all the committed logs peer owns,
 		//testBackup2B introduces a condition where the peer with larger lastLogIndex has smaller commitIndex,if the peer won the election
 		//it begins sending AppendEntries,result in duplicating commits
-		if (rf.Log[lastLogIndex].Term <= args.LastLogTerm || args.LastLogIndex >= lastLogIndex) && args.LastCommit >= rf.commitIndex{
+		//if the candidate's term equals to the peer's, we need to check the index again to make sure the candidate's log is up-to-date
+		if (args.LastLogTerm==rf.Log[lastLogIndex].Term&&lastLogIndex<= args.LastLogIndex) || rf.Log[lastLogIndex].Term < args.LastLogTerm {
 			rf.voteFor = args.CandidateId
 			rf.generateElectionTimeout()
 			rf.currentTerm = args.Term
 			rf.switchStateTo(Follower)
 			rf.persist()
+
 			reply.Success = true
 			reply.Term = rf.currentTerm
 			rf.mu.Unlock()
@@ -322,6 +325,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		}else{
 			logEntry := LogEntry{Command: command,Term: rf.currentTerm}
 			rf.Log = append(rf.Log,logEntry)
+			rf.persist()
+
 			index = len(rf.Log) - 1
 			term = rf.currentTerm
 			isLeader = true
@@ -389,14 +394,16 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.matchIndex = make([]int,size)
 	rf.electionTimeoutChan = make(chan bool)
 
-	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
-
 	rf.generateElectionTimeout()
 	go rf.triggerTimeoutEvent()
 	go rf.electionTimeoutTik()
 	go rf.heartbeatTimeoutTik()
 	go rf.applyEntries()
+
+	// initialize from state persisted before a crash
+	rf.mu.Lock()
+	rf.readPersist(persister.ReadRaftState())
+	rf.mu.Unlock()
 
 	return rf
 }
@@ -453,9 +460,10 @@ func (rf *Raft) startElection() {
 	rf.generateElectionTimeout()
 	//switch to candidate state
 	rf.switchStateTo(Candidate)
-	rf.persist()
 	rf.currentTerm += 1
 	DPrintf("Starting election,candidate id: %d,candidate term: %d\n",rf.me,rf.currentTerm)
+
+	rf.persist()
 	rf.mu.Unlock()
 
 	votes := 1
@@ -507,19 +515,20 @@ func (rf *Raft) startElection() {
 					rf.mu.Unlock()
 					return
 				}
+
 				votes += 1
 				DPrintf("Vote granted to candidate,current candidate: %d,current candidate term: %d,current votes: %d,threshold to win %d,voter's term: %d,current role %d\n", rf.me, rf.currentTerm, votes,thresholdToWin, reply.Term,rf.state)
 				if votes >= thresholdToWin{
 					if rf.state == Candidate{
 						DPrintf("Candidate %d won the election with %d/%d votes\n",rf.me,votes,len(rf.peers))
 						rf.switchStateTo(Leader)
-						rf.persist()
 						rf.leaderId = rf.me
 						for i,_ := range rf.peers{
 							rf.nextIndex[i] = len(rf.Log)
 							rf.matchIndex[i] = 0
 						}
 						go rf.sendHeartbeat()
+						rf.persist()
 					}
 				}
 				rf.mu.Unlock()
@@ -529,9 +538,10 @@ func (rf *Raft) startElection() {
 					DPrintf("Failed to elect,the candidate id: %d,the candidate's term is less than peer's\n", rf.me)
 					//the candidate's term is less than the peer's,the peer rejected it
 					rf.switchStateTo(Follower)
-					rf.persist()
 					rf.voteFor = -1
+
 					rf.currentTerm = reply.Term
+					rf.persist()
 					rf.generateElectionTimeout()
 				}
 				rf.mu.Unlock()
@@ -577,9 +587,10 @@ func (rf *Raft)AppendEntries(args AppendEntriesArgs,reply *AppendEntriesApply) {
 	rf.mu.Lock()
 	if args.Term > rf.currentTerm{
 		rf.switchStateTo(Follower)
-		rf.persist()
 		rf.voteFor = -1
 		rf.currentTerm = args.Term
+
+		rf.persist()
 		rf.generateElectionTimeout()
 	}
 
@@ -587,7 +598,6 @@ func (rf *Raft)AppendEntries(args AppendEntriesArgs,reply *AppendEntriesApply) {
 		rf.Log = append(rf.Log[:args.PrevLogIndex+1],entries...)
 		DPrintf("Appending entries,current leader id :%d,current term: %d\n",args.LeaderId,args.Term)
 		rf.switchStateTo(Follower)
-		rf.persist()
 		rf.generateElectionTimeout()
 		rf.leaderId = args.LeaderId
 
@@ -597,16 +607,21 @@ func (rf *Raft)AppendEntries(args AppendEntriesArgs,reply *AppendEntriesApply) {
 			}else{
 				rf.commitIndex = args.LeaderCommit
 			}
+
 			DPrintf("Peer %d commit index %d\n",rf.me,rf.commitIndex)
 			rf.applyCond.Broadcast()
 		}
+
 		reply.Success = true
 		reply.Term = rf.currentTerm
+
+		rf.persist()
 		rf.mu.Unlock()
 		return
 	}
 
 	DPrintf("Consistency check failed,length of peer's: %d,prevLogIndex of leader's: %d\n",len(rf.Log),args.PrevLogTerm)
+
 	reply.Success = false
 	reply.Term = rf.currentTerm
 	rf.mu.Unlock()
@@ -720,13 +735,22 @@ func (rf *Raft) BroadcastAppendEntries(isHeartbeat bool) {
 				if rf.currentTerm < reply.Term{
 					DPrintf("Peer's term greater than leader's,switch to follower.peer's term: %d,leader's term: %d\n",reply.Term,rf.currentTerm)
 					rf.switchStateTo(Follower)
-					rf.persist()
 					rf.voteFor = -1
+					rf.currentTerm = reply.Term
+
+					rf.persist()
 					rf.generateElectionTimeout()
 				}else{
-					DPrintf("Peer's log is conflict with leaders,decrease the nextIndex to %d and try again\n",rf.nextIndex[i]-1)
+					DPrintf("Peer's log conflicts with leaders,decrease the nextIndex to %d and try again\n",rf.nextIndex[i]-1)
 					rf.nextIndex[i] -= 1
+					//TODO
+					if rf.nextIndex[i] < 1{
+						rf.nextIndex[i] = 1
+					}
 					rf.matchIndex[i] -= 1
+					if rf.matchIndex[i] < 1{
+						rf.matchIndex[i] = 1
+					}
 					rf.mu.Unlock()
 					goto retry
 				}
@@ -747,8 +771,8 @@ func (rf *Raft) applyEntries() {
 		if rf.lastApplied==rf.commitIndex{
 			rf.applyCond.Wait()
 		}else{
-			DPrintf("Starting apply message to log\n")
-			for i := rf.lastApplied + 1;i <= rf.commitIndex;i++{
+			//committing could be happened before the leader replicates the log to the peer,wait for it
+			for i := rf.lastApplied + 1;i <= rf.commitIndex&& i<=len(rf.Log) -1;i++{
 				applyMsg := ApplyMsg{CommandValid: true,Command: rf.Log[i].Command,CommandIndex: i}
 				rf.lastApplied = i
 				rf.applyCh <- applyMsg
